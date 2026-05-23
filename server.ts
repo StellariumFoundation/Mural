@@ -7,8 +7,99 @@ import { spawn } from "child_process";
 import fs from "fs";
 import "dotenv/config";
 
+const backupDir = path.join(process.cwd(), "tor_service_backup");
+
+function restoreTorBackup(torDir: string): boolean {
+  if (fs.existsSync(backupDir)) {
+    const files = ["hostname", "hs_ed25519_public_key", "hs_ed25519_secret_key"];
+    const allExist = files.every(file => fs.existsSync(path.join(backupDir, file)));
+    if (allExist) {
+      console.log("📂 [Tor Service] Restoring persistent onion keys from local backup...");
+      files.forEach(file => {
+        const src = path.join(backupDir, file);
+        const dest = path.join(torDir, file);
+        fs.copyFileSync(src, dest);
+        fs.chmodSync(dest, 0o600);
+      });
+      return true;
+    }
+  }
+  return false;
+}
+
+function saveTorBackup(torDir: string) {
+  const secretKeyPath = path.join(torDir, "hs_ed25519_secret_key");
+  if (fs.existsSync(secretKeyPath)) {
+    if (!fs.existsSync(backupDir)) {
+      fs.mkdirSync(backupDir, { recursive: true });
+    }
+    const files = ["hostname", "hs_ed25519_public_key", "hs_ed25519_secret_key"];
+    files.forEach(file => {
+      const src = path.join(torDir, file);
+      const dest = path.join(backupDir, file);
+      if (fs.existsSync(src)) {
+        fs.copyFileSync(src, dest);
+        console.log(`💾 [Tor Service] Backed up ${file} to local backup folder.`);
+      }
+    });
+  }
+}
+
+async function restoreTorKeysFromDatabase(client: any, torDir: string): Promise<boolean> {
+  try {
+    const result = await client.execute("SELECT filename, content_base64 FROM tor_keys");
+    if (result.rows && result.rows.length > 0) {
+      console.log(`📂 [Tor DB Restore] Found ${result.rows.length} keys in Turso, restoring...`);
+      if (!fs.existsSync(torDir)) {
+        fs.mkdirSync(torDir, { recursive: true });
+      }
+      fs.chmodSync(torDir, 0o700);
+
+      for (const row of result.rows) {
+        const filename = row.filename as string;
+        const base64Content = row.content_base64 as string;
+        const dest = path.join(torDir, filename);
+        const buffer = Buffer.from(base64Content, "base64");
+        fs.writeFileSync(dest, buffer);
+        fs.chmodSync(dest, 0o600);
+        console.log(`📂 [Tor DB Restore] Successfully restored ${filename}`);
+      }
+      return true;
+    } else {
+      console.log("📂 [Tor DB Restore] No keys found in database yet. Generating brand new onion identity.");
+      return false;
+    }
+  } catch (err: any) {
+    console.error("⚠️ [Tor DB Restore] Could not restore keys from database:", err.message);
+    return false;
+  }
+}
+
+async function saveTorKeysToDatabase(client: any, torDir: string) {
+  try {
+    const files = ["hostname", "hs_ed25519_public_key", "hs_ed25519_secret_key"];
+    const allExist = files.every(file => fs.existsSync(path.join(torDir, file)));
+    if (!allExist) return;
+
+    console.log("💾 [Tor DB Save] Storing onion keys to Turso database for permanent persistence...");
+    for (const file of files) {
+      const src = path.join(torDir, file);
+      const content = fs.readFileSync(src);
+      const base64Content = content.toString("base64");
+      
+      await client.execute({
+        sql: "INSERT OR REPLACE INTO tor_keys (filename, content_base64) VALUES (?, ?)",
+        args: [file, base64Content]
+      });
+      console.log(`💾 [Tor DB Save] Persisted ${file} in database.`);
+    }
+  } catch (err: any) {
+    console.error("⚠️ [Tor DB Save] Failed to write key files to database:", err.message);
+  }
+}
+
 // Starts the Tor Hidden Service in the background
-function launchTorDaemon() {
+async function launchTorDaemon(client: any) {
   console.log("🧅 [Tor Service] Searching for Tor daemon...");
   
   const torrcPath = path.join(process.cwd(), "torrc");
@@ -23,6 +114,14 @@ function launchTorDaemon() {
 
     const torrcContent = `SocksPort 0\nHiddenServiceDir ${torDir}\nHiddenServicePort 80 127.0.0.1:3000\n`;
     fs.writeFileSync(torrcPath, torrcContent, "utf8");
+
+    // 1. Try to restore onion identity from central database (survives any Render rebuild/destroy)
+    const restoredFromDB = await restoreTorKeysFromDatabase(client, torDir);
+    
+    // 2. Fallback to local files if database setup is pristine
+    if (!restoredFromDB) {
+      restoreTorBackup(torDir);
+    }
 
     const torProcess = spawn("tor", ["-f", torrcPath]);
 
@@ -52,13 +151,20 @@ function launchTorDaemon() {
 
     // Check for the onion address periodically and print it prominently
     const hostnameFile = path.join(torDir, "hostname");
-    const checkOnion = setInterval(() => {
+    const checkOnion = setInterval(async () => {
       if (fs.existsSync(hostnameFile)) {
         const address = fs.readFileSync(hostnameFile, "utf8").trim();
         console.log("\n====================================================");
         console.log("🌟 ONION DEPLOYMENT ONLINE!");
         console.log(`🔗 Active Onion Link: http://${address}`);
         console.log("====================================================\n");
+        
+        // Backup files to database immediately for future container spins or Render redeploys
+        await saveTorKeysToDatabase(client, torDir);
+
+        // Also update local folder backup
+        saveTorBackup(torDir);
+        
         clearInterval(checkOnion);
       }
     }, 1000);
@@ -75,9 +181,6 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // Let Tor fire up in the background
-  launchTorDaemon();
-
   // Initialize Turso database client (LibSQL)
   const tursoUrl = process.env.TURSO_DATABASE_URL || "libsql://water-database-stellarfoundation.aws-us-west-2.turso.io";
   const tursoToken = process.env.TURSO_AUTH_TOKEN || "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJleHAiOjE5MDYzMzU5OTUsImlhdCI6MTc3OTUwMDc5NSwiaWQiOiIwMTllNTI4MS1jZDAxLTc5OWUtYjgyYi1iNjY5MmIwM2IwZjEiLCJyaWQiOiJkY2YwMjAyMy00MjUyLTQ0ZDMtYjBkNC02YmQxM2MyOTg5ZTUifQ.4CBKWqMGwr_8rvC_aU49gmgYi84HvG22duxogwjJokA3NtH-egJtrP6iqwneVp4fu2rkha1NLbmypWgnPXQTCA";
@@ -91,6 +194,22 @@ async function startServer() {
     url: tursoUrl,
     authToken: tursoToken,
   });
+
+  // Ensure Tor key persistence table first
+  try {
+    await client.execute(`
+      CREATE TABLE IF NOT EXISTS tor_keys (
+        filename TEXT PRIMARY KEY,
+        content_base64 TEXT
+      )
+    `);
+    console.log("✅ [Tor Database] tor_keys table verified/created successfully.");
+  } catch (dbErr) {
+    console.error("❌ [Tor Database] Failed to initialize tor_keys schema:", dbErr);
+  }
+
+  // Let Tor fire up in the background (using initialized Turso client for persistent backup)
+  launchTorDaemon(client);
 
   // Set up table that supports media uploads fully within Turso (SQLite dialect)
   try {
