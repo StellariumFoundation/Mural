@@ -1,11 +1,13 @@
 import express from "express";
 import path from "path";
 import pg from "pg";
-const { Pool } = pg;
 import multer from "multer";
 import { createServer as createViteServer } from "vite";
 import { spawn } from "child_process";
 import fs from "fs";
+import "dotenv/config";
+
+const { Pool } = pg;
 
 // Starts the Tor Hidden Service in the background
 function launchTorDaemon() {
@@ -78,82 +80,32 @@ async function startServer() {
   // Let Tor fire up in the background
   launchTorDaemon();
 
-  // Initialize PostgreSQL pool
-  let connectionString = process.env.DATABASE_URL || "postgresql://water_database_1pll_user:15g6P1mVNxgsCU0f7mfuZzplzqx1pH8k@dpg-d88g07rbc2fs73e69nvg-a/water_database_1pll";
-  let pool: any;
-
-  // Set up a fresh table in PostgreSQL
-  async function initDatabase() {
-    try {
-      const match = connectionString.match(/^(postgresql:\/\/[^:]+:[^@]+@)([^//?#]+)(.*)$/);
-      if (match) {
-        const prefix = match[1];
-        const host = match[2];
-        const path = match[3];
-
-        if (!host.includes(".")) {
-          // It's an internal Render host. Since we are running outside Render's internal network, we try external candidates.
-          const candidates = [
-            host + ".oregon-postgres.render.com",
-            host + ".frankfurt-postgres.render.com",
-            host + ".singapore-postgres.render.com",
-            host + ".ohio-postgres.render.com"
-          ];
-
-          for (const candHost of candidates) {
-            const candUrl = `${prefix}${candHost}${path}`;
-            console.log(`🔌 [Postgres] Testing connection to candidate host: ${candHost}...`);
-            const testPool = new Pool({
-              connectionString: candUrl,
-              ssl: { rejectUnauthorized: false },
-              connectionTimeoutMillis: 5000 // Fast failing
-            });
-
-            try {
-              const testQueryResult = await testPool.query("SELECT 1");
-              if (testQueryResult) {
-                connectionString = candUrl;
-                console.log(`✅ [Postgres] Successfully resolved to Render external host: ${candHost}!`);
-                await testPool.end().catch(() => {});
-                break;
-              }
-            } catch (e: any) {
-              console.log(`ℹ️ [Postgres] Could not connect to external host candidate ${candHost}: ${e.message}`);
-              await testPool.end().catch(() => {});
-            }
-          }
-        }
-      }
-
-      pool = new Pool({
-        connectionString,
-        ssl: connectionString.includes("127.0.0.1") || connectionString.includes("localhost") ? false : { rejectUnauthorized: false }
-      });
-
-      await pool.query(`
-        CREATE TABLE IF NOT EXISTS mural_messages (
-          id SERIAL PRIMARY KEY,
-          message TEXT,
-          author TEXT,
-          media_data BYTEA,
-          media_mime TEXT,
-          media_name TEXT,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-      `);
-      console.log("✅ PostgreSQL Database Initialized Successfully!");
-    } catch (error: any) {
-      console.error("⚠️ [Postgres] Database initialization failed:", error.message);
-      // Fallback: make sure pool is always initialized so that query handlers don't crash with undefined pool.
-      if (!pool) {
-        pool = new Pool({
-          connectionString,
-          ssl: connectionString.includes("127.0.0.1") || connectionString.includes("localhost") ? false : { rejectUnauthorized: false }
-        });
-      }
+  // Initialize PostgreSQL database pool
+  const connectionString = process.env.DATABASE_URL || "postgresql://water_database_1pll_user:15g6P1mVNxgsCU0f7mfuZzplzqx1pH8k@dpg-d88g07rbc2fs73e69nvg-a.oregon-postgres.render.com/water_database_1pll";
+  const pool = new Pool({
+    connectionString,
+    ssl: {
+      rejectUnauthorized: false
     }
+  });
+
+  // Set up table that supports media uploads fully within PostgreSQL
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mural_messages (
+        id SERIAL PRIMARY KEY,
+        message TEXT,
+        author TEXT,
+        media_data BYTEA,
+        media_mime TEXT,
+        media_name TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log("✅ [Postgres] mural_messages table verified/created successfully.");
+  } catch (dbErr) {
+    console.error("❌ [Postgres] Failed to initialize database schema:", dbErr);
   }
-  await initDatabase();
 
   app.use(express.json());
 
@@ -188,9 +140,10 @@ async function startServer() {
         SELECT media_data, media_mime 
         FROM mural_messages 
         WHERE id = $1
-      `, [parseInt(id, 10) || 0]);
+      `, [id]);
 
       const row = result.rows[0];
+
       if (!row || !row.media_data) {
         return res.status(404).send("Media file not found");
       }
