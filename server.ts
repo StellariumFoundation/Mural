@@ -1,6 +1,7 @@
 import express from "express";
 import path from "path";
-import Database from "better-sqlite3";
+import pg from "pg";
+const { Pool } = pg;
 import multer from "multer";
 import { createServer as createViteServer } from "vite";
 import { spawn } from "child_process";
@@ -77,22 +78,75 @@ async function startServer() {
   // Let Tor fire up in the background
   launchTorDaemon();
 
-  // Initialize SQLite database
-  const dbPath = path.join(process.cwd(), "mural.db");
-  const db = new Database(dbPath);
+  // Initialize PostgreSQL pool
+  const connectionString = process.env.DATABASE_URL || "postgresql://water_database_1pll_user:15g6P1mVNxgsCU0f7mfuZzplzqx1pH8k@dpg-d88g07rbc2fs73e69nvg-a/water_database_1pll";
+  let pool = new Pool({
+    connectionString,
+    ssl: connectionString.includes("127.0.0.1") || connectionString.includes("localhost") ? false : { rejectUnauthorized: false }
+  });
 
-  // Set up a fresh table that supports media uploads fully within SQLite
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS mural_messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      message TEXT,
-      author TEXT,
-      media_data BLOB,
-      media_mime TEXT,
-      media_name TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
+  // Set up a fresh table in PostgreSQL
+  async function initDatabase() {
+    try {
+      const match = connectionString.match(/^(postgresql:\/\/[^:]+:[^@]+@)([^//?#]+)(.*)$/);
+      if (match) {
+        const prefix = match[1];
+        const host = match[2];
+        const path = match[3];
+
+        if (!host.includes(".")) {
+          // It's an internal Render host. Since we are running outside Render's internal network, we try external candidates.
+          const candidates = [
+            host + ".oregon-postgres.render.com",
+            host + ".frankfurt-postgres.render.com",
+            host + ".singapore-postgres.render.com",
+            host + ".ohio-postgres.render.com",
+            host
+          ];
+
+          for (const candHost of candidates) {
+            const candUrl = `${prefix}${candHost}${path}`;
+            console.log(`🔌 [Postgres] Testing connection to candidate host: ${candHost}...`);
+            const testPool = new Pool({
+              connectionString: candUrl,
+              ssl: { rejectUnauthorized: false },
+              connectionTimeoutMillis: 5000 // Fast failing
+            });
+
+            try {
+              const testQueryResult = await testPool.query("SELECT 1");
+              if (testQueryResult) {
+                // Connection succeeded! Clean up old pool and assign the new pool.
+                await pool.end().catch(() => {});
+                pool = testPool;
+                console.log(`✅ [Postgres] Successfully connected externally to Render host: ${candHost}!`);
+                break;
+              }
+            } catch (e: any) {
+              console.log(`ℹ️ [Postgres] Could not connect to host ${candHost}: ${e.message}`);
+              await testPool.end().catch(() => {});
+            }
+          }
+        }
+      }
+
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS mural_messages (
+          id SERIAL PRIMARY KEY,
+          message TEXT,
+          author TEXT,
+          media_data BYTEA,
+          media_mime TEXT,
+          media_name TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      console.log("✅ PostgreSQL Database Initialized Successfully!");
+    } catch (error: any) {
+      console.error("⚠️ [Postgres] Database initialization failed:", error.message);
+    }
+  }
+  initDatabase();
 
   app.use(express.json());
 
@@ -105,14 +159,14 @@ async function startServer() {
   });
 
   // GET messages (excludes media_data to keep JSON payload lightweight)
-  app.get("/api/messages", (req, res) => {
+  app.get("/api/messages", async (req, res) => {
     try {
-      const messages = db.prepare(`
+      const result = await pool.query(`
         SELECT id, message, author, media_mime, media_name, created_at 
         FROM mural_messages 
         ORDER BY id DESC
-      `).all();
-      res.json(messages);
+      `);
+      res.json(result.rows);
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: "Failed to load messages" });
@@ -120,15 +174,16 @@ async function startServer() {
   });
 
   // GET media on-demand (serves binary content with appropriate mimetype)
-  app.get("/api/media/:id", (req, res) => {
+  app.get("/api/media/:id", async (req, res) => {
     try {
       const { id } = req.params;
-      const row = db.prepare(`
+      const result = await pool.query(`
         SELECT media_data, media_mime 
         FROM mural_messages 
-        WHERE id = ?
-      `).get(id) as { media_data: Buffer; media_mime: string } | undefined;
+        WHERE id = $1
+      `, [parseInt(id, 10) || 0]);
 
+      const row = result.rows[0];
       if (!row || !row.media_data) {
         return res.status(404).send("Media file not found");
       }
@@ -142,7 +197,7 @@ async function startServer() {
   });
 
   // POST new message with optional media file
-  app.post("/api/messages", upload.single("file"), (req, res) => {
+  app.post("/api/messages", upload.single("file"), async (req, res) => {
     try {
       const { message, author } = req.body;
       const file = req.file;
@@ -151,18 +206,16 @@ async function startServer() {
         return res.status(400).json({ error: "Either text or media is required to post!" });
       }
 
-      const stmt = db.prepare(`
+      await pool.query(`
         INSERT INTO mural_messages (message, author, media_data, media_mime, media_name)
-        VALUES (?, ?, ?, ?, ?)
-      `);
-
-      stmt.run(
+        VALUES ($1, $2, $3, $4, $5)
+      `, [
         message || "",
         author || "Anonymous",
         file ? file.buffer : null,
         file ? file.mimetype : null,
         file ? file.originalname : null
-      );
+      ]);
 
       res.status(201).json({ success: true });
     } catch (error) {
