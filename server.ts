@@ -1,13 +1,11 @@
 import express from "express";
 import path from "path";
-import pg from "pg";
+import { createClient } from "@libsql/client";
 import multer from "multer";
 import { createServer as createViteServer } from "vite";
 import { spawn } from "child_process";
 import fs from "fs";
 import "dotenv/config";
-
-const { Pool } = pg;
 
 // Starts the Tor Hidden Service in the background
 function launchTorDaemon() {
@@ -80,31 +78,36 @@ async function startServer() {
   // Let Tor fire up in the background
   launchTorDaemon();
 
-  // Initialize PostgreSQL database pool
-  const connectionString = process.env.DATABASE_URL || "postgresql://water_database_1pll_user:15g6P1mVNxgsCU0f7mfuZzplzqx1pH8k@dpg-d88g07rbc2fs73e69nvg-a.oregon-postgres.render.com/water_database_1pll";
-  const pool = new Pool({
-    connectionString,
-    ssl: {
-      rejectUnauthorized: false
-    }
+  // Initialize Turso database client (LibSQL)
+  const tursoUrl = process.env.TURSO_DATABASE_URL || "libsql://water-database-stellarfoundation.aws-us-west-2.turso.io";
+  const tursoToken = process.env.TURSO_AUTH_TOKEN || "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJleHAiOjE5MDYzMzU5OTUsImlhdCI6MTc3OTUwMDc5NSwiaWQiOiIwMTllNTI4MS1jZDAxLTc5OWUtYjgyYi1iNjY5MmIwM2IwZjEiLCJyaWQiOiJkY2YwMjAyMy00MjUyLTQ0ZDMtYjBkNC02YmQxM2MyOTg5ZTUifQ.4CBKWqMGwr_8rvC_aU49gmgYi84HvG22duxogwjJokA3NtH-egJtrP6iqwneVp4fu2rkha1NLbmypWgnPXQTCA";
+
+  if (!tursoUrl) {
+    console.error("❌ [Turso] TURSO_DATABASE_URL environment variable is missing.");
+    throw new Error("TURSO_DATABASE_URL environment variable is required to start the server.");
+  }
+
+  const client = createClient({
+    url: tursoUrl,
+    authToken: tursoToken,
   });
 
-  // Set up table that supports media uploads fully within PostgreSQL
+  // Set up table that supports media uploads fully within Turso (SQLite dialect)
   try {
-    await pool.query(`
+    await client.execute(`
       CREATE TABLE IF NOT EXISTS mural_messages (
-        id SERIAL PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         message TEXT,
         author TEXT,
-        media_data BYTEA,
+        media_data BLOB,
         media_mime TEXT,
         media_name TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    console.log("✅ [Postgres] mural_messages table verified/created successfully.");
+    console.log("✅ [Turso] mural_messages table verified/created successfully.");
   } catch (dbErr) {
-    console.error("❌ [Postgres] Failed to initialize database schema:", dbErr);
+    console.error("❌ [Turso] Failed to initialize database schema:", dbErr);
   }
 
   app.use(express.json());
@@ -120,7 +123,7 @@ async function startServer() {
   // GET messages (excludes media_data to keep JSON payload lightweight)
   app.get("/api/messages", async (req, res) => {
     try {
-      const result = await pool.query(`
+      const result = await client.execute(`
         SELECT id, message, author, media_mime, media_name, created_at 
         FROM mural_messages 
         ORDER BY id DESC
@@ -136,11 +139,10 @@ async function startServer() {
   app.get("/api/media/:id", async (req, res) => {
     try {
       const { id } = req.params;
-      const result = await pool.query(`
-        SELECT media_data, media_mime 
-        FROM mural_messages 
-        WHERE id = $1
-      `, [id]);
+      const result = await client.execute({
+        sql: "SELECT media_data, media_mime FROM mural_messages WHERE id = ?",
+        args: [id]
+      });
 
       const row = result.rows[0];
 
@@ -148,8 +150,9 @@ async function startServer() {
         return res.status(404).send("Media file not found");
       }
 
-      res.setHeader("Content-Type", row.media_mime || "application/octet-stream");
-      res.send(row.media_data);
+      const mediaData = Buffer.from(row.media_data as any);
+      res.setHeader("Content-Type", (row.media_mime as string) || "application/octet-stream");
+      res.send(mediaData);
     } catch (error) {
       console.error(error);
       res.status(500).send("Failed to load media file");
@@ -166,16 +169,16 @@ async function startServer() {
         return res.status(400).json({ error: "Either text or media is required to post!" });
       }
 
-      await pool.query(`
-        INSERT INTO mural_messages (message, author, media_data, media_mime, media_name)
-        VALUES ($1, $2, $3, $4, $5)
-      `, [
-        message || "",
-        author || "Anonymous",
-        file ? file.buffer : null,
-        file ? file.mimetype : null,
-        file ? file.originalname : null
-      ]);
+      await client.execute({
+        sql: "INSERT INTO mural_messages (message, author, media_data, media_mime, media_name) VALUES (?, ?, ?, ?, ?)",
+        args: [
+          message || "",
+          author || "Anonymous",
+          file ? new Uint8Array(file.buffer) : null,
+          file ? file.mimetype : null,
+          file ? file.originalname : null
+        ]
+      });
 
       res.status(201).json({ success: true });
     } catch (error) {
