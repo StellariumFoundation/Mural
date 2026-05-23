@@ -79,11 +79,8 @@ async function startServer() {
   launchTorDaemon();
 
   // Initialize PostgreSQL pool
-  const connectionString = process.env.DATABASE_URL || "postgresql://water_database_1pll_user:15g6P1mVNxgsCU0f7mfuZzplzqx1pH8k@dpg-d88g07rbc2fs73e69nvg-a/water_database_1pll";
-  let pool = new Pool({
-    connectionString,
-    ssl: connectionString.includes("127.0.0.1") || connectionString.includes("localhost") ? false : { rejectUnauthorized: false }
-  });
+  let connectionString = process.env.DATABASE_URL || "postgresql://water_database_1pll_user:15g6P1mVNxgsCU0f7mfuZzplzqx1pH8k@dpg-d88g07rbc2fs73e69nvg-a/water_database_1pll";
+  let pool: any;
 
   // Set up a fresh table in PostgreSQL
   async function initDatabase() {
@@ -100,8 +97,7 @@ async function startServer() {
             host + ".oregon-postgres.render.com",
             host + ".frankfurt-postgres.render.com",
             host + ".singapore-postgres.render.com",
-            host + ".ohio-postgres.render.com",
-            host
+            host + ".ohio-postgres.render.com"
           ];
 
           for (const candHost of candidates) {
@@ -116,19 +112,23 @@ async function startServer() {
             try {
               const testQueryResult = await testPool.query("SELECT 1");
               if (testQueryResult) {
-                // Connection succeeded! Clean up old pool and assign the new pool.
-                await pool.end().catch(() => {});
-                pool = testPool;
-                console.log(`✅ [Postgres] Successfully connected externally to Render host: ${candHost}!`);
+                connectionString = candUrl;
+                console.log(`✅ [Postgres] Successfully resolved to Render external host: ${candHost}!`);
+                await testPool.end().catch(() => {});
                 break;
               }
             } catch (e: any) {
-              console.log(`ℹ️ [Postgres] Could not connect to host ${candHost}: ${e.message}`);
+              console.log(`ℹ️ [Postgres] Could not connect to external host candidate ${candHost}: ${e.message}`);
               await testPool.end().catch(() => {});
             }
           }
         }
       }
+
+      pool = new Pool({
+        connectionString,
+        ssl: connectionString.includes("127.0.0.1") || connectionString.includes("localhost") ? false : { rejectUnauthorized: false }
+      });
 
       await pool.query(`
         CREATE TABLE IF NOT EXISTS mural_messages (
@@ -144,9 +144,16 @@ async function startServer() {
       console.log("✅ PostgreSQL Database Initialized Successfully!");
     } catch (error: any) {
       console.error("⚠️ [Postgres] Database initialization failed:", error.message);
+      // Fallback: make sure pool is always initialized so that query handlers don't crash with undefined pool.
+      if (!pool) {
+        pool = new Pool({
+          connectionString,
+          ssl: connectionString.includes("127.0.0.1") || connectionString.includes("localhost") ? false : { rejectUnauthorized: false }
+        });
+      }
     }
   }
-  initDatabase();
+  await initDatabase();
 
   app.use(express.json());
 
