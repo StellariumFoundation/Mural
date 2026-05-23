@@ -1,9 +1,11 @@
 # Use official Node.js runtime as parent image
 FROM node:20-slim
 
-# Install Tor and dependencies
+# Install Tor, python3, and build tools for native npm compilation
 RUN apt-get update && apt-get install -y \
     tor \
+    python3 \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
