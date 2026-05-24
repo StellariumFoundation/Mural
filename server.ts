@@ -98,9 +98,69 @@ async function saveTorKeysToDatabase(client: any, torDir: string) {
   }
 }
 
+let activeTorProcess: any = null;
+let isRestartingTor = false;
+
+// Keeps the Render instance from going to sleep by quietly hitting its own HTTP URL
+function startKeepAlive() {
+  const appUrl = process.env.APP_URL;
+  if (!appUrl || appUrl.includes("localhost") || appUrl.includes("127.0.0.1")) {
+    console.log("ℹ️ [Keep-Alive] Running in local environment or APP_URL not configured. Skipping active self-pings.");
+    return;
+  }
+  
+  console.log(`🔗 [Keep-Alive] Registering self-ping loop to ${appUrl} every 10 minutes to prevent Render sleeps...`);
+  setInterval(async () => {
+    try {
+      const res = await fetch(`${appUrl.trim()}/api/messages`);
+      console.log(`📡 [Keep-Alive] Self-ping loaded successfully: status ${res.status}.`);
+    } catch (err: any) {
+      console.log(`📡 [Keep-Alive] Self-ping warning (could not hit endpoint): ${err.message}`);
+    }
+  }, 10 * 60 * 1000); // 10 minutes (Render's sleep timeout is 15 minutes)
+}
+
+// Detects if the server container went to sleep (freeze) and woke up (thaw)
+function startFreezeThawWatcher(client: any) {
+  let lastTime = Date.now();
+  console.log("🔄 [Tor System] Initializing freeze-thaw sleep-wake cycle watcher...");
+  setInterval(() => {
+    const currentTime = Date.now();
+    const diff = currentTime - lastTime;
+    
+    // Interval of 5000ms. If it took more than 20 seconds, we woke up from a sleep!
+    if (diff > 20000) {
+      console.log(`⚠️ [Tor System] Sleep-wake cycle (VM pause/resume) detected! (Time gap: ${diff}ms)`);
+      console.log("🔄 Automatically restarting Tor daemon to restore circuits...");
+      restartTor(client);
+    }
+    lastTime = currentTime;
+  }, 5000);
+}
+
+function restartTor(client: any) {
+  if (isRestartingTor) return;
+  isRestartingTor = true;
+
+  try {
+    if (activeTorProcess) {
+      console.log("🛑 Terminating existing stale Tor daemon process...");
+      activeTorProcess.kill("SIGKILL");
+      activeTorProcess = null;
+    }
+  } catch (err: any) {
+    console.error("⚠️ [Tor System] Error terminating stale Tor daemon:", err.message);
+  }
+
+  setTimeout(() => {
+    isRestartingTor = false;
+    launchTorDaemon(client);
+  }, 3000);
+}
+
 // Starts the Tor Hidden Service in the background
 async function launchTorDaemon(client: any) {
-  console.log("🧅 [Tor Service] Searching for Tor daemon...");
+  console.log("🧅 [Tor Service] Starting Tor daemon...");
   
   const torrcPath = path.join(process.cwd(), "torrc");
   const torDir = path.join(process.cwd(), "tor_service");
@@ -109,7 +169,7 @@ async function launchTorDaemon(client: any) {
     if (!fs.existsSync(torDir)) {
       fs.mkdirSync(torDir, { recursive: true });
     }
-    // Set 750 or 700 permissions which Tor strictly requires
+    // Set 700 permissions which Tor strictly requires
     fs.chmodSync(torDir, 0o700);
 
     const torrcContent = `SocksPort 0\nHiddenServiceDir ${torDir}\nHiddenServicePort 80 127.0.0.1:3000\n`;
@@ -124,6 +184,7 @@ async function launchTorDaemon(client: any) {
     }
 
     const torProcess = spawn("tor", ["-f", torrcPath]);
+    activeTorProcess = torProcess;
 
     torProcess.on("error", (err) => {
       console.log("ℹ️ [Tor Service] Quietly caught spawn error (Tor is not installed in this container/development sandbox. It will run in your Render web service environment where Docker installs Tor automatically):", err.message);
@@ -147,6 +208,15 @@ async function launchTorDaemon(client: any) {
 
     torProcess.on("close", (code) => {
       console.log(`[Tor Process] Exited daemon with status code ${code}`);
+      if (activeTorProcess === torProcess) {
+        activeTorProcess = null;
+        if (!isRestartingTor) {
+          console.log("⚠️ [Tor Service] Tor process died unexpectedly. Restarting in 5 seconds...");
+          setTimeout(() => {
+            launchTorDaemon(client);
+          }, 5000);
+        }
+      }
     });
 
     // Check for the onion address periodically and print it prominently
@@ -209,7 +279,11 @@ async function startServer() {
   }
 
   // Let Tor fire up in the background (using initialized Turso client for persistent backup)
-  launchTorDaemon(client);
+  await launchTorDaemon(client);
+
+  // Initialize sleep-wake cycle watcher and active self-pinger
+  startFreezeThawWatcher(client);
+  startKeepAlive();
 
   // Set up table that supports media uploads fully within Turso (SQLite dialect)
   try {
