@@ -1,0 +1,6 @@
+{
+  "name": "Stellarium Mural",
+  "description": "A public mural where anyone can post and the owner can moderate by deleting messages.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
